@@ -79,11 +79,16 @@ def node_run_sandbox(state: AgentState) -> AgentState:
         passed = [r for r in results if r.success]
         failed = [r for r in results if not r.success]
 
+        retry = state.get("retry_count", 0)
+        if not passed:
+            print(f"\n[Agent] No patches passed. Retrying patch generation (attempt {retry + 1})...")
+
         return {
             **state,
             "results": results,
             "passed_patches": passed,
             "failed_patches": failed,
+            "retry_count": retry + 1,   # ← THIS WAS MISSING
             "error": None
         }
     except Exception as e:
@@ -168,12 +173,10 @@ def route_after_sandbox(state: AgentState) -> str:
     passed = state.get("passed_patches", [])
     if passed:
         return "summarize"
-    # No patches passed — retry if we haven't exceeded limit
     retry = state.get("retry_count", 0)
     if retry < 2:
-        print(f"\n[Agent] No patches passed. Retrying patch generation (attempt {retry + 1})...")
         return "generate_patches"
-    return "summarize"
+    return "summarize"  # give up after 2 retries
 
 def route_after_error(state: AgentState) -> str:
     if state.get("error"):
