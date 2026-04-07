@@ -18,6 +18,7 @@ CLASS_IMPORT_MAP = {
     "Request":              "from requests.models import Request",
     "Session":              "from requests.sessions import Session",
     "SessionRedirectMixin": "from requests.sessions import SessionRedirectMixin",
+    "RequestsCookieJar":    "from requests.cookies import RequestsCookieJar",  # ← new
 }
 
 # Maps (class_name, method_name) → how to monkey-patch it
@@ -32,6 +33,20 @@ PATCH_TARGET_MAP = {
     ("Session",              "prepare_request"):    "Session.prepare_request",
     ("SessionRedirectMixin", "resolve_redirects"):  "SessionRedirectMixin.resolve_redirects",
     ("SessionRedirectMixin", "rebuild_auth"):       "SessionRedirectMixin.rebuild_auth",
+    ("RequestsCookieJar",    "set"):                "RequestsCookieJar.set",           # ← new
+    ("RequestsCookieJar",    "set_cookie"):         "RequestsCookieJar.set_cookie",    # ← new
+    ("RequestsCookieJar",    "update"):             "RequestsCookieJar.update",        # ← new
+}
+
+# Python 2 → Python 3 module renames to fix in LLM-generated patches
+PY2_TO_PY3 = {
+    "cookielib":        "http.cookiejar",
+    "urllib2":          "urllib.request",
+    "urllib.quote":     "urllib.parse.quote",
+    "urllib.urlencode": "urllib.parse.urlencode",
+    "urlparse":         "urllib.parse",
+    "httplib":          "http.client",
+    "BaseHTTPServer":   "http.server",
 }
 
 
@@ -103,6 +118,12 @@ class SandboxExecutor:
         finally:
             os.unlink(script_path)
 
+    def _fix_py2_imports(self, code: str) -> str:
+        """Replace Python 2 module names with their Python 3 equivalents."""
+        for py2, py3 in PY2_TO_PY3.items():
+            code = re.sub(rf'\b{re.escape(py2)}\b', py3, code)
+        return code
+
     def _extract_method_names(self, code: str) -> List[str]:
         """Extract all top-level def names from a patch code block."""
         return re.findall(r"^def (\w+)", code, flags=re.MULTILINE)
@@ -128,26 +149,34 @@ class SandboxExecutor:
         imports = [
             "import pickle",
             "import requests",
+            "from http.cookiejar import CookieJar",  # fixes any cookielib refs in patches
         ]
-        # Always import the class being patched
+
         class_name = patch.class_name
+
+        # Always import the class being patched
         if class_name in CLASS_IMPORT_MAP:
             imports.append(CLASS_IMPORT_MAP[class_name])
 
-        # For pickle tests on Response, we also need PreparedRequest for _next
-        keywords_text = patch.class_name.lower()
+        # Extra imports per class
         if class_name == "Response":
             imports.append("from requests.models import PreparedRequest")
+
         if class_name in ("Session", "SessionRedirectMixin"):
             imports.append("from requests.sessions import Session, SessionRedirectMixin")
+            imports.append("from requests.cookies import RequestsCookieJar")
+
+        if class_name == "RequestsCookieJar":
+            imports.append("from requests.sessions import Session")
 
         return imports
 
     def _build_test_script(self, issue_data: IssueData, patch: PatchResult) -> str:
         """Build a test script scoped exactly to the class being patched."""
 
-        # 1. Clean and rename all defs in the patch to patched_<name>
+        # 1. Clean, fix Python 2 references, rename defs to patched_<name>
         clean_patch = textwrap.dedent(patch.patched_code).strip()
+        clean_patch = self._fix_py2_imports(clean_patch)
         renamed_patch = re.sub(
             r"^def (\w+)",
             r"def patched_\1",
@@ -163,16 +192,20 @@ class SandboxExecutor:
 
         # 4. Detect issue type
         keywords = " ".join(issue_data.issue_body[:500].lower().split())
-        is_pickle_issue = any(w in keywords for w in ["pickle", "pickling", "unpickle"])
+        is_pickle_issue   = any(w in keywords for w in ["pickle", "pickling", "unpickle"])
         is_encoding_issue = any(w in keywords for w in ["encoding", "charset", "unicode", "utf"])
-        is_session_issue = "session" in patch.class_name.lower()
+        is_cookie_issue   = any(w in keywords for w in ["cookie", "cookies", "cookiejar", "cookiepolicy"])
+        is_session_issue  = "session" in patch.class_name.lower()
 
-        # 5. Build imports scoped to what this test actually needs
+        # 5. Build imports
         imports = self._build_imports(patch)
 
-        # 6. Choose test block based on class + issue type
+        # 6. Choose test block
         class_name = patch.class_name
-        test_block = self._select_test_block(class_name, is_pickle_issue, is_encoding_issue, is_session_issue)
+        test_block = self._select_test_block(
+            class_name, is_pickle_issue, is_encoding_issue,
+            is_cookie_issue, is_session_issue
+        )
 
         lines = [
             *imports,
@@ -196,7 +229,8 @@ class SandboxExecutor:
         class_name: str,
         is_pickle_issue: bool,
         is_encoding_issue: bool,
-        is_session_issue: bool
+        is_cookie_issue: bool,
+        is_session_issue: bool,
     ) -> str:
         """Return the right test block for the class + issue combination."""
 
@@ -254,6 +288,56 @@ class SandboxExecutor:
                 prep2.body = b"data"
                 restored2 = pickle.loads(pickle.dumps(prep2))
                 assert restored2.body == b"data"
+                print("  PASS")
+            """).strip()
+
+        elif class_name in ("Session", "SessionRedirectMixin") and is_cookie_issue:
+            return textwrap.dedent("""
+                print("Test 1: Session respects custom cookie jar...")
+                s = Session()
+                custom_jar = RequestsCookieJar()
+                custom_jar.set("testcookie", "testvalue", domain="example.com", path="/")
+                from requests import Request
+                req = Request("GET", "https://example.com/", cookies=custom_jar)
+                prepared = s.prepare_request(req)
+                assert "testcookie" in prepared.headers.get("Cookie", ""), \
+                    f"Cookie not in request headers: {prepared.headers}"
+                print("  PASS")
+
+                print("Test 2: Per-request cookies override session cookies...")
+                s2 = Session()
+                s2.cookies.set("session_cookie", "session_val", domain="example.com", path="/")
+                req2 = Request("GET", "https://example.com/",
+                               cookies={"request_cookie": "request_val"})
+                prepared2 = s2.prepare_request(req2)
+                cookie_header = prepared2.headers.get("Cookie", "")
+                assert "request_cookie" in cookie_header, \
+                    f"Per-request cookie missing: {cookie_header}"
+                print("  PASS")
+            """).strip()
+
+        elif class_name == "RequestsCookieJar" and is_cookie_issue:
+            return textwrap.dedent("""
+                print("Test 1: RequestsCookieJar basic set...")
+                jar = RequestsCookieJar()
+                jar.set("key", "value", domain="example.com", path="/")
+                assert jar["key"] == "value"
+                print("  PASS")
+
+                print("Test 2: Cookie policy can be overridden...")
+                from http.cookiejar import DefaultCookiePolicy
+                jar2 = RequestsCookieJar()
+                policy = DefaultCookiePolicy(allowed_domains=["example.com"])
+                jar2.set_policy(policy)
+                jar2.set("allowed", "yes", domain="example.com", path="/")
+                assert jar2["allowed"] == "yes"
+                print("  PASS")
+
+                print("Test 3: Cookie jar works with Session...")
+                s = Session()
+                s.cookies = RequestsCookieJar()
+                s.cookies.set("sc", "sv", domain="example.com", path="/")
+                assert s.cookies["sc"] == "sv"
                 print("  PASS")
             """).strip()
 

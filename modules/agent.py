@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from typing import TypedDict, List, Optional, Annotated
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
@@ -12,7 +13,6 @@ load_dotenv()
 
 
 # ── Agent State ───────────────────────────────────────────────────────────────
-# This is the shared memory that flows through every node in the graph
 class AgentState(TypedDict):
     # Input
     repo_name: str
@@ -30,6 +30,9 @@ class AgentState(TypedDict):
     retry_count: int
     error: Optional[str]
     final_summary: Optional[str]
+
+    # Output
+    output_dir: Optional[str]   # set by node_save_output
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
@@ -88,7 +91,7 @@ def node_run_sandbox(state: AgentState) -> AgentState:
             "results": results,
             "passed_patches": passed,
             "failed_patches": failed,
-            "retry_count": retry + 1,   # ← THIS WAS MISSING
+            "retry_count": retry + 1,
             "error": None
         }
     except Exception as e:
@@ -105,7 +108,7 @@ def node_summarize(state: AgentState) -> AgentState:
 
     lines = []
     lines.append("=" * 60)
-    lines.append(f"AGENT REPORT")
+    lines.append("AGENT REPORT")
     lines.append("=" * 60)
     lines.append(f"Repo    : {issue.repo_name}")
     lines.append(f"Issue   : #{issue.issue_number} — {issue.issue_title}")
@@ -137,6 +140,78 @@ def node_summarize(state: AgentState) -> AgentState:
     summary = "\n".join(lines)
     print(summary)
     return {**state, "final_summary": summary}
+
+
+def node_save_output(state: AgentState) -> AgentState:
+    """Node 6: Save patches and report to results/<repo>_<issue>/"""
+    print("\n[Agent] ▶ Node: save_output")
+
+    issue = state["issue_data"]
+    passed = state.get("passed_patches", [])
+    summary = state.get("final_summary", "")
+
+    # Build a clean folder name: e.g. results/psf_requests_6361/
+    repo_slug = issue.repo_name.replace("/", "_")
+    folder_name = f"{repo_slug}_{issue.issue_number}"
+    output_dir = os.path.join("results", folder_name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    saved_files = []
+
+    # 1. Save each passing patch as its own .py file
+    for result in passed:
+        patch = result.patch
+        filename = f"patch_{patch.class_name}.py"
+        filepath = os.path.join(output_dir, filename)
+
+        header = (
+            f"# Patch for: {issue.repo_name} issue #{issue.issue_number}\n"
+            f"# Class    : {patch.class_name}\n"
+            f"# File     : {patch.filepath}\n"
+            f"# Confidence: {patch.confidence.upper()}\n"
+            f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"#\n"
+            f"# Explanation:\n"
+        )
+        for line in patch.explanation.splitlines():
+            header += f"#   {line}\n"
+        header += "\n"
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(header + patch.patched_code + "\n")
+
+        saved_files.append(filepath)
+        print(f"[Agent] ✓ Saved patch  → {filepath}")
+
+    # 2. Save the full report as report.md
+    report_path = os.path.join(output_dir, "report.md")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(f"# Agent Report\n\n")
+        f.write(f"**Repo:** {issue.repo_name}  \n")
+        f.write(f"**Issue:** #{issue.issue_number} — {issue.issue_title}  \n")
+        f.write(f"**Generated:** {timestamp}  \n\n")
+        f.write("---\n\n")
+        f.write("```\n")
+        f.write(summary)
+        f.write("\n```\n\n")
+
+        if passed:
+            f.write("## Passing Patches\n\n")
+            for result in passed:
+                patch = result.patch
+                f.write(f"### `{patch.class_name}` → `{patch.filepath}`\n\n")
+                f.write(f"**Confidence:** {patch.confidence.upper()}  \n\n")
+                f.write(f"**Explanation:**  \n{patch.explanation}\n\n")
+                f.write(f"**Fix:**\n```python\n{patch.patched_code}\n```\n\n")
+                f.write(f"**Test Output:**\n```\n{result.test_output.strip()}\n```\n\n")
+
+    saved_files.append(report_path)
+    print(f"[Agent] ✓ Saved report → {report_path}")
+    print(f"\n[Agent] All outputs saved to: {output_dir}/")
+
+    return {**state, "output_dir": output_dir}
 
 
 def node_handle_error(state: AgentState) -> AgentState:
@@ -190,25 +265,27 @@ def build_agent() -> StateGraph:
     graph = StateGraph(AgentState)
 
     # Add nodes
-    graph.add_node("fetch_issue", node_fetch_issue)
-    graph.add_node("parse_code", node_parse_code)
+    graph.add_node("fetch_issue",      node_fetch_issue)
+    graph.add_node("parse_code",       node_parse_code)
     graph.add_node("generate_patches", node_generate_patches)
-    graph.add_node("run_sandbox", node_run_sandbox)
-    graph.add_node("summarize", node_summarize)
-    graph.add_node("handle_error", node_handle_error)
+    graph.add_node("run_sandbox",      node_run_sandbox)
+    graph.add_node("summarize",        node_summarize)
+    graph.add_node("save_output",      node_save_output)   # ← new
+    graph.add_node("handle_error",     node_handle_error)
 
     # Entry point
     graph.set_entry_point("fetch_issue")
 
-    # Add conditional edges
-    graph.add_conditional_edges("fetch_issue", route_after_fetch)
-    graph.add_conditional_edges("parse_code", route_after_parse)
+    # Edges
+    graph.add_conditional_edges("fetch_issue",      route_after_fetch)
+    graph.add_conditional_edges("parse_code",       route_after_parse)
     graph.add_conditional_edges("generate_patches", route_after_generate)
-    graph.add_conditional_edges("run_sandbox", route_after_sandbox)
-    graph.add_conditional_edges("handle_error", route_after_error)
+    graph.add_conditional_edges("run_sandbox",      route_after_sandbox)
+    graph.add_conditional_edges("handle_error",     route_after_error)
 
-    # Terminal node
-    graph.add_edge("summarize", END)
+    # summarize always flows into save_output, then END
+    graph.add_edge("summarize",   "save_output")
+    graph.add_edge("save_output", END)
 
     return graph.compile()
 
@@ -220,17 +297,18 @@ def run_agent(repo_name: str, issue_number: int) -> str:
     agent = build_agent()
 
     initial_state: AgentState = {
-        "repo_name": repo_name,
-        "issue_number": issue_number,
-        "issue_data": None,
-        "parsed_code": None,
-        "patches": None,
-        "results": None,
+        "repo_name":      repo_name,
+        "issue_number":   issue_number,
+        "issue_data":     None,
+        "parsed_code":    None,
+        "patches":        None,
+        "results":        None,
         "passed_patches": None,
         "failed_patches": None,
-        "retry_count": 0,
-        "error": None,
-        "final_summary": None,
+        "retry_count":    0,
+        "error":          None,
+        "final_summary":  None,
+        "output_dir":     None,
     }
 
     print(f"\n[Agent] Starting for {repo_name} issue #{issue_number}")
