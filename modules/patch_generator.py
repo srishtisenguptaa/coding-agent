@@ -42,9 +42,20 @@ class PatchGenerator:
             if not cls.name.startswith("Test") and "test" not in cls.filepath.lower()
         ]
 
+        # Build a map of ALL other source classes for context injection
+        # This prevents the LLM from mixing up attributes across classes
+        all_classes_by_name = {cls.name: cls for cls in source_classes}
+
         for cls in source_classes:
             print(f"\n[Patch Generator] Analyzing {cls.name} in {cls.filepath}...")
-            result = self._generate_patch(issue_data, cls, parsed.issue_keywords)
+
+            # Pass sibling classes as read-only context
+            sibling_classes = [
+                c for name, c in all_classes_by_name.items()
+                if name != cls.name
+            ]
+
+            result = self._generate_patch(issue_data, cls, parsed.issue_keywords, sibling_classes)
             if result:
                 results.append(result)
 
@@ -54,9 +65,22 @@ class PatchGenerator:
         self,
         issue_data: IssueData,
         cls: ClassInfo,
-        keywords: List[str]
+        keywords: List[str],
+        sibling_classes: List[ClassInfo]
     ) -> Optional[PatchResult]:
         """Ask Groq to fix a specific class."""
+
+        # Build sibling context block so the LLM knows what belongs where
+        sibling_context = ""
+        if sibling_classes:
+            sibling_context = "\n## Related Classes (READ-ONLY — do NOT fix these, do NOT use their attributes)\n"
+            for sibling in sibling_classes:
+                sibling_context += f"""
+### `{sibling.name}` in `{sibling.filepath}`
+```python
+{sibling.source[:1500]}
+```
+"""
 
         prompt = f"""You are an expert Python developer fixing a real GitHub bug.
 
@@ -70,22 +94,29 @@ class PatchGenerator:
 ```python
 {cls.source[:3000]}
 ```
+{sibling_context}
+## STRICT RULES
+- You are ONLY fixing `{cls.name}`. Do not touch any other class.
+- Only use attributes that are defined in `{cls.name}.__init__` or explicitly set in `{cls.name}`.
+- Do NOT reference attributes from related classes (e.g. if fixing `Response`, do not use attributes from `PreparedRequest`).
+- Do NOT rewrite the entire class — only fix the broken method(s).
+- If `{cls.name}` does not have a bug related to the issue, respond with CONFIDENCE: low and no code.
 
 ## Your Task
-1. Identify the exact bug in this class related to the issue
+1. Identify the exact bug in `{cls.name}` related to the issue
 2. Write the COMPLETE fixed version of only the buggy method(s)
-3. Do NOT rewrite the entire class — only fix what's broken
+3. Only use `self.` attributes you can see defined in the class above
 
 ## Response Format (follow this EXACTLY)
 
 EXPLANATION:
-[one paragraph explaining what the bug is and why your fix works]
+[one paragraph explaining what the bug is in `{cls.name}` specifically, and why your fix works]
 
 CONFIDENCE: [high/medium/low]
 
 FIXED_METHOD:
 ```python
-[paste only the fixed method(s) here, complete and runnable]
+[paste only the fixed method(s) here, using ONLY attributes from {cls.name}]
 ```
 """
 
@@ -95,14 +126,19 @@ FIXED_METHOD:
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a senior Python engineer. You fix bugs precisely and minimally. Never rewrite code that isn't broken."
+                        "content": (
+                            f"You are a senior Python engineer fixing ONLY the `{cls.name}` class. "
+                            "You are laser-focused on this one class. "
+                            "Never reference attributes from other classes. "
+                            "Never rewrite code that isn't broken."
+                        )
                     },
                     {
                         "role": "user",
                         "content": prompt
                     }
                 ],
-                temperature=0.1,  # low temperature = more deterministic fixes
+                temperature=0.1,
                 max_tokens=2000
             )
 
@@ -127,6 +163,11 @@ FIXED_METHOD:
             conf_match = re.search(r"CONFIDENCE:\s*(high|medium|low)", raw, re.IGNORECASE)
             if conf_match:
                 confidence = conf_match.group(1).lower()
+
+            # If LLM says low confidence, skip — class likely has no bug
+            if confidence == "low":
+                print(f"[Patch Generator] Skipping {cls.name} — LLM confidence is low (likely not buggy)")
+                return None
 
             # Extract FIXED_METHOD code block
             code = ""
