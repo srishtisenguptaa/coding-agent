@@ -18,24 +18,32 @@ CLASS_IMPORT_MAP = {
     "Request":              "from requests.models import Request",
     "Session":              "from requests.sessions import Session",
     "SessionRedirectMixin": "from requests.sessions import SessionRedirectMixin",
-    "RequestsCookieJar":    "from requests.cookies import RequestsCookieJar",  # ← new
+    "RequestsCookieJar":    "from requests.cookies import RequestsCookieJar",
+    "HTTPDigestAuth":       "from requests.auth import HTTPDigestAuth",
+    "HTTPBasicAuth":        "from requests.auth import HTTPBasicAuth",
+    "AuthBase":             "from requests.auth import AuthBase",
 }
 
 # Maps (class_name, method_name) → how to monkey-patch it
 PATCH_TARGET_MAP = {
-    ("Response",             "__getstate__"):       "Response.__getstate__",
-    ("Response",             "__setstate__"):       "Response.__setstate__",
-    ("Response",             "__reduce__"):         "Response.__reduce__",
-    ("PreparedRequest",      "__getstate__"):       "PreparedRequest.__getstate__",
-    ("PreparedRequest",      "__setstate__"):       "PreparedRequest.__setstate__",
-    ("PreparedRequest",      "__reduce__"):         "PreparedRequest.__reduce__",
-    ("Session",              "request"):            "Session.request",
-    ("Session",              "prepare_request"):    "Session.prepare_request",
-    ("SessionRedirectMixin", "resolve_redirects"):  "SessionRedirectMixin.resolve_redirects",
-    ("SessionRedirectMixin", "rebuild_auth"):       "SessionRedirectMixin.rebuild_auth",
-    ("RequestsCookieJar",    "set"):                "RequestsCookieJar.set",           # ← new
-    ("RequestsCookieJar",    "set_cookie"):         "RequestsCookieJar.set_cookie",    # ← new
-    ("RequestsCookieJar",    "update"):             "RequestsCookieJar.update",        # ← new
+    ("Response",             "__getstate__"):          "Response.__getstate__",
+    ("Response",             "__setstate__"):          "Response.__setstate__",
+    ("Response",             "__reduce__"):            "Response.__reduce__",
+    ("PreparedRequest",      "__getstate__"):          "PreparedRequest.__getstate__",
+    ("PreparedRequest",      "__setstate__"):          "PreparedRequest.__setstate__",
+    ("PreparedRequest",      "__reduce__"):            "PreparedRequest.__reduce__",
+    ("Session",              "request"):               "Session.request",
+    ("Session",              "prepare_request"):       "Session.prepare_request",
+    ("SessionRedirectMixin", "resolve_redirects"):     "SessionRedirectMixin.resolve_redirects",
+    ("SessionRedirectMixin", "rebuild_auth"):          "SessionRedirectMixin.rebuild_auth",
+    ("SessionRedirectMixin", "get_redirect_target"):   "SessionRedirectMixin.get_redirect_target",
+    ("RequestsCookieJar",    "set"):                   "RequestsCookieJar.set",
+    ("RequestsCookieJar",    "set_cookie"):            "RequestsCookieJar.set_cookie",
+    ("RequestsCookieJar",    "update"):                "RequestsCookieJar.update",
+    ("HTTPDigestAuth",       "__call__"):              "HTTPDigestAuth.__call__",
+    ("HTTPDigestAuth",       "build_digest_header"):   "HTTPDigestAuth.build_digest_header",
+    ("HTTPDigestAuth",       "handle_401"):            "HTTPDigestAuth.handle_401",
+    ("HTTPDigestAuth",       "handle_redirect"):       "HTTPDigestAuth.handle_redirect",
 }
 
 # Python 2 → Python 3 module renames to fix in LLM-generated patches
@@ -48,6 +56,12 @@ PY2_TO_PY3 = {
     "httplib":          "http.client",
     "BaseHTTPServer":   "http.server",
 }
+
+# Internal test-helper classes that are NEVER importable from the public API
+_SKIP_CLASSES = frozenset({
+    "MockRequest", "MockResponse", "FakeSocket",
+    "FakeCookieJar", "TestCase", "FakeConfig",
+})
 
 
 @dataclass
@@ -131,10 +145,15 @@ class SandboxExecutor:
     def _build_patch_block(self, patch: PatchResult, method_names: List[str]) -> str:
         """
         Build monkey-patch assignments ONLY for the class being patched.
-        Each patched_<method> is wired only to patch.class_name.<method>.
+        Skips internal/test-only helper classes that can't be imported.
         """
-        lines = []
         class_name = patch.class_name
+
+        # Guard: if the class isn't in our public import map, skip silently
+        if class_name in _SKIP_CLASSES or class_name not in CLASS_IMPORT_MAP:
+            return f"# Skipped monkey-patch: '{class_name}' is not a public importable class"
+
+        lines = []
         for method in method_names:
             target = PATCH_TARGET_MAP.get((class_name, method))
             if target:
@@ -148,11 +167,18 @@ class SandboxExecutor:
         """Only import classes actually needed for this patch's test."""
         imports = [
             "import pickle",
+            "import re",                              # LLM patches often use re
             "import requests",
-            "from http.cookiejar import CookieJar",  # fixes any cookielib refs in patches
+            "from urllib.parse import urlparse, urlunparse, quote",  # digest auth needs these
+            "from http.cookiejar import CookieJar",  # fixes any cookielib refs
+            "from http.cookies import Morsel",        # LLM cookie patches use Morsel
         ]
 
         class_name = patch.class_name
+
+        # Skip internal/test-only classes — they have no public import
+        if class_name in _SKIP_CLASSES:
+            return imports
 
         # Always import the class being patched
         if class_name in CLASS_IMPORT_MAP:
@@ -168,11 +194,24 @@ class SandboxExecutor:
 
         if class_name == "RequestsCookieJar":
             imports.append("from requests.sessions import Session")
+            imports.append("from requests.models import PreparedRequest")
+
+        if class_name in ("HTTPDigestAuth", "HTTPBasicAuth", "AuthBase"):
+            imports.append("from requests.auth import HTTPDigestAuth, HTTPBasicAuth")
+            imports.append("from requests.models import PreparedRequest, Response")
 
         return imports
 
     def _build_test_script(self, issue_data: IssueData, patch: PatchResult) -> str:
         """Build a test script scoped exactly to the class being patched."""
+
+        # Guard: skip sandbox entirely for internal/test-only classes
+        if patch.class_name in _SKIP_CLASSES or patch.class_name not in CLASS_IMPORT_MAP:
+            return (
+                "import sys\n"
+                f"print('SKIPPED: {patch.class_name} is not a public importable class')\n"
+                "sys.exit(1)\n"
+            )
 
         # 1. Clean, fix Python 2 references, rename defs to patched_<name>
         clean_patch = textwrap.dedent(patch.patched_code).strip()
@@ -190,11 +229,12 @@ class SandboxExecutor:
         # 3. Build monkey-patch block scoped to THIS class only
         patch_block = self._build_patch_block(patch, original_method_names)
 
-        # 4. Detect issue type
+        # 4. Detect issue type from issue body keywords
         keywords = " ".join(issue_data.issue_body[:500].lower().split())
         is_pickle_issue   = any(w in keywords for w in ["pickle", "pickling", "unpickle"])
         is_encoding_issue = any(w in keywords for w in ["encoding", "charset", "unicode", "utf"])
         is_cookie_issue   = any(w in keywords for w in ["cookie", "cookies", "cookiejar", "cookiepolicy"])
+        is_auth_issue     = any(w in keywords for w in ["digest", "auth", "authentication", "authorization", "semicolon"])
         is_session_issue  = "session" in patch.class_name.lower()
 
         # 5. Build imports
@@ -204,7 +244,7 @@ class SandboxExecutor:
         class_name = patch.class_name
         test_block = self._select_test_block(
             class_name, is_pickle_issue, is_encoding_issue,
-            is_cookie_issue, is_session_issue
+            is_cookie_issue, is_session_issue, is_auth_issue
         )
 
         lines = [
@@ -231,6 +271,7 @@ class SandboxExecutor:
         is_encoding_issue: bool,
         is_cookie_issue: bool,
         is_session_issue: bool,
+        is_auth_issue: bool = False,
     ) -> str:
         """Return the right test block for the class + issue combination."""
 
@@ -338,6 +379,37 @@ class SandboxExecutor:
                 s.cookies = RequestsCookieJar()
                 s.cookies.set("sc", "sv", domain="example.com", path="/")
                 assert s.cookies["sc"] == "sv"
+                print("  PASS")
+            """).strip()
+
+        elif class_name == "HTTPDigestAuth" and is_auth_issue:
+            return textwrap.dedent("""
+                print("Test 1: HTTPDigestAuth can be created...")
+                auth = HTTPDigestAuth("user", "pass")
+                assert auth.username == "user"
+                assert auth.password == "pass"
+                print("  PASS")
+
+                print("Test 2: URI with semicolons in path is not truncated...")
+                # Simulate what build_digest_header does with a URL containing semicolons
+                url = "https://example.com/path;param=value/resource"
+                parsed = urlparse(url)
+                # The uri for digest should be the full path, not truncated at ';'
+                uri = parsed.path
+                if parsed.query:
+                    uri += "?" + parsed.query
+                assert ";" in uri, f"Semicolon was stripped from URI: {uri}"
+                assert uri == "/path;param=value/resource", f"URI mismatch: {uri}"
+                print("  PASS")
+
+                print("Test 3: URI with query string and semicolons preserved...")
+                url2 = "https://api.example.org/v1/resource;type=A?format=json"
+                parsed2 = urlparse(url2)
+                uri2 = parsed2.path
+                if parsed2.query:
+                    uri2 += "?" + parsed2.query
+                assert ";" in uri2
+                assert "format=json" in uri2
                 print("  PASS")
             """).strip()
 

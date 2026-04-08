@@ -322,3 +322,5 @@ def run_agent(repo_name: str, issue_number: int) -> str:
     print(f"\n[Agent] Starting for {repo_name} issue #{issue_number}")
     final_state = agent.invoke(initial_state)
     return final_state.get("final_summary", "No summary generated.")
+# Create a global instance of the graph for the API to import
+graph = build_agent()
