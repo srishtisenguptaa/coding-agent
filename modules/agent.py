@@ -1,8 +1,7 @@
 import os
 from datetime import datetime
-from typing import TypedDict, List, Optional, Annotated
+from typing import TypedDict, List, Optional
 from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
 from modules.github_reader import GitHubReader, IssueData
 from modules.code_parser import CodeParser, ParsedCode
 from modules.patch_generator import PatchGenerator, PatchResult
@@ -32,7 +31,7 @@ class AgentState(TypedDict):
     final_summary: Optional[str]
 
     # Output
-    output_dir: Optional[str]   # set by node_save_output
+    output_dir: Optional[str]
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
@@ -102,9 +101,11 @@ def node_summarize(state: AgentState) -> AgentState:
     """Node 5: Generate a final human-readable summary."""
     print("\n[Agent] ▶ Node: summarize")
 
-    passed = state.get("passed_patches", [])
-    failed = state.get("failed_patches", [])
-    issue = state["issue_data"]
+    # ✅ FIX: use `or []` instead of `.get(key, [])` so that an explicitly
+    #         stored None value is also replaced with an empty list.
+    passed = state.get("passed_patches") or []
+    failed = state.get("failed_patches") or []
+    issue  = state["issue_data"]
 
     lines = []
     lines.append("=" * 60)
@@ -147,20 +148,20 @@ def node_save_output(state: AgentState) -> AgentState:
     print("\n[Agent] ▶ Node: save_output")
 
     issue = state["issue_data"]
-    passed = state.get("passed_patches", [])
+    # ✅ FIX: same guard — `or []` handles both missing key and stored None
+    passed  = state.get("passed_patches") or []
     summary = state.get("final_summary", "")
 
-    # Build a clean folder name: e.g. results/psf_requests_6361/
-    repo_slug = issue.repo_name.replace("/", "_")
+    repo_slug   = issue.repo_name.replace("/", "_")
     folder_name = f"{repo_slug}_{issue.issue_number}"
-    output_dir = os.path.join("results", folder_name)
+    output_dir  = os.path.join("results", folder_name)
     os.makedirs(output_dir, exist_ok=True)
 
     saved_files = []
 
     # 1. Save each passing patch as its own .py file
     for result in passed:
-        patch = result.patch
+        patch    = result.patch
         filename = f"patch_{patch.class_name}.py"
         filepath = os.path.join(output_dir, filename)
 
@@ -185,7 +186,7 @@ def node_save_output(state: AgentState) -> AgentState:
 
     # 2. Save the full report as report.md
     report_path = os.path.join(output_dir, "report.md")
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(f"# Agent Report\n\n")
@@ -245,18 +246,25 @@ def route_after_generate(state: AgentState) -> str:
 def route_after_sandbox(state: AgentState) -> str:
     if state.get("error"):
         return "handle_error"
-    passed = state.get("passed_patches", [])
+    passed = state.get("passed_patches") or []
     if passed:
         return "summarize"
     retry = state.get("retry_count", 0)
     if retry < 2:
         return "generate_patches"
-    return "summarize"  # give up after 2 retries
+    return "summarize"
 
 def route_after_error(state: AgentState) -> str:
+    # ✅ FIX: previously always retried from fetch_issue, causing the agent
+    #         to re-fetch + re-parse on every sandbox failure (3× wasted API
+    #         calls). Now we only go back to fetch_issue if we never got
+    #         issue_data in the first place; otherwise skip straight to
+    #         generate_patches so only the patch step is retried.
     if state.get("error"):
-        return "summarize"  # give up
-    return "fetch_issue"    # retry from start
+        return "summarize"          # max retries exhausted → give up
+    if state.get("issue_data") is not None:
+        return "generate_patches"   # already have the issue, just retry patching
+    return "fetch_issue"            # very first fetch failed → retry from scratch
 
 
 # ── Build the Graph ───────────────────────────────────────────────────────────
@@ -270,20 +278,20 @@ def build_agent() -> StateGraph:
     graph.add_node("generate_patches", node_generate_patches)
     graph.add_node("run_sandbox",      node_run_sandbox)
     graph.add_node("summarize",        node_summarize)
-    graph.add_node("save_output",      node_save_output)   # ← new
+    graph.add_node("save_output",      node_save_output)
     graph.add_node("handle_error",     node_handle_error)
 
     # Entry point
     graph.set_entry_point("fetch_issue")
 
-    # Edges
+    # Conditional edges
     graph.add_conditional_edges("fetch_issue",      route_after_fetch)
     graph.add_conditional_edges("parse_code",       route_after_parse)
     graph.add_conditional_edges("generate_patches", route_after_generate)
     graph.add_conditional_edges("run_sandbox",      route_after_sandbox)
     graph.add_conditional_edges("handle_error",     route_after_error)
 
-    # summarize always flows into save_output, then END
+    # summarize → save_output → END
     graph.add_edge("summarize",   "save_output")
     graph.add_edge("save_output", END)
 
